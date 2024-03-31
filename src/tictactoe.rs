@@ -78,6 +78,8 @@ impl TicTacToe {
 }
 
 impl Game for TicTacToe {
+    const IS_PERFECT_INFORMATION: bool = true;
+
     type Move = usize;
     type GameState = WinState;
     type Player = bool;
