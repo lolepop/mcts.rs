@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Ok, Result};
 
-use crate::game::Game;
+use crate::game::{Game, MoveScore};
 
 #[derive(Debug, Clone, Copy)]
 pub enum WinState {
@@ -116,11 +116,11 @@ impl Game for TicTacToe {
         }
     }
 
-    fn score_state(&self, state: Self::GameState, player: Self::Player) -> Option<f32> {
+    fn score_state(&self, state: Self::GameState, player: Self::Player) -> MoveScore {
         match state {
-            WinState::Win => Some(if self.first_player_turn == player { 1f32 } else { -3f32 }),
-            WinState::Draw => Some(0.5f32),
-            _ => None
+            WinState::Win => if self.first_player_turn == player { MoveScore::Terminal(1f32) } else { MoveScore::Terminal(-3f32) },
+            WinState::Draw => MoveScore::Terminal(0.5),
+            _ => MoveScore::None
         }
     }
 }

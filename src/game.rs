@@ -10,6 +10,29 @@ fn uct(score: f32, visits: u32, total_visits: u32, c: f32) -> f32 {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum MoveScore {
+    Terminal(f32),
+    NonTerminal(f32),
+    None
+}
+
+impl MoveScore {
+    fn is_terminal(&self) -> bool {
+        match self {
+            MoveScore::Terminal(_) => true,
+            _ => false
+        }
+    }
+
+    fn score(&self) -> f32 {
+        match self {
+            MoveScore::Terminal(s) | MoveScore::NonTerminal(s) => *s,
+            MoveScore::None => 0f32,
+        }
+    }
+}
+
 pub trait Game: Clone + Debug {
     const IS_PERFECT_INFORMATION: bool;
 
@@ -21,8 +44,7 @@ pub trait Game: Clone + Debug {
     fn place_move(&mut self, movement: Self::Move) -> Result<Self::GameState>;
     /// returns score used for backpropagation.
     /// none if state is not terminal
-    /// TODO: create enum variant for non-terminal scoring (heuristics)
-    fn score_state(&self, state: Self::GameState, player: Self::Player) -> Option<f32>;
+    fn score_state(&self, state: Self::GameState, player: Self::Player) -> MoveScore;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,12 +141,11 @@ impl<G: Game> Mcts<G> {
         (diff.len() > 0).then(|| diff)
     }
 
-    fn select(&mut self, game: &mut G) -> (Vec<NodeId>, Option<f32>) {
-        let mut traversal = vec![self.root];
-        let mut last_score: Option<f32> = None;
+    fn select(&mut self, game: &mut G) -> Vec<(NodeId, MoveScore)> {
+        let mut traversal = vec![(self.root, MoveScore::None)];
         let mut pending_move_diff: Option<Vec<G::Move>> = None;
         loop {
-            let last_id = *traversal.last().unwrap();
+            let (last_id, _) = *traversal.last().unwrap();
             let node_children = self.tree.children(last_id).unwrap();
             if node_children.len() == 0 {
                 // println!("selection: {traversal:?}");
@@ -146,19 +167,22 @@ impl<G: Game> Mcts<G> {
                     .map(|(i, s)| (i, uct(s.score, s.visits, total_visits, 2f32.sqrt()), s.placement_move.clone()))
                     .max_by(|(_, a, _), (_, b, _)| a.total_cmp(b))
                     .unwrap();
-            traversal.push(node_children[selected_node]);
-
+            
             let s = game.place_move(placement_move).unwrap();
-            last_score = game.score_state(s, self.player_id.clone());
+            let last_score = game.score_state(s, self.player_id.clone());
+            traversal.push((node_children[selected_node], last_score));
+
         }
+
+        
+        // expansion step
+        let (selected_node, last_score) = *traversal.last().unwrap();
 
         // exit early if terminal node was selected
-        if last_score.is_some() {
-            return (traversal, last_score);
+        if last_score.is_terminal() {
+            return traversal;
         }
 
-        // expansion step
-        let selected_node = *traversal.last().unwrap();
         let next_selection = if let Some(mut pending_move_diff) = pending_move_diff {
             // extension of selection, expand but take into account only new nodes - only randomly select from new nodes
             *pending_move_diff.iter_mut()
@@ -175,27 +199,33 @@ impl<G: Game> Mcts<G> {
         };
 
         let s = game.place_move(self.tree.node(next_selection).unwrap().placement_move.clone()).unwrap();
-        last_score = game.score_state(s, self.player_id.clone());
+        let last_score = game.score_state(s, self.player_id.clone());
 
-        traversal.push(next_selection);
-        (traversal, last_score)
+        traversal.push((next_selection, last_score));
+        traversal
     }
 
+    // only returns scoring of terminal state
     fn rollout(&mut self, game: &mut G) -> f32 {
+        let mut acc_score = 0f32;
         loop {
             let random_move = game.possible_moves().choose(&mut rand::thread_rng()).unwrap().clone();
-            let score = game.place_move(random_move).unwrap();
-            if let Some(score) = game.score_state(score, self.player_id.clone()) {
-                return score;
+            let s = game.place_move(random_move).unwrap();
+            let score = game.score_state(s, self.player_id.clone());
+            acc_score += score.score();
+            if score.is_terminal() {
+                return acc_score;
             }
         }
     }
 
-    fn backpropagate(&mut self, traversal: &Vec<NodeId>, score: f32) {
-        for id in traversal {
+    fn backpropagate(&mut self, traversal: &Vec<(NodeId, MoveScore)>, rollout_score: f32) {
+        let mut acc_score = rollout_score;
+        for (id, move_score) in traversal.iter().rev() {
+            acc_score += move_score.score();
             let n = &mut self.tree.nodes[**id];
             n.visits += 1;
-            n.score += score;
+            n.score += acc_score;
         }
     }
 
@@ -214,13 +244,15 @@ impl<G: Game> Mcts<G> {
             let mut game = base_game.clone();
             // let mut last_score: Option<f32> = None;
             // select and expand
-            let (selected, last_score) = self.select(&mut game);
+            let selected = self.select(&mut game);
+
+            let (_, last_score) = selected.last().unwrap();
 
             // rollout
-            let rollout_score = if let Some(premature_end_score) = last_score {
-                premature_end_score
-            } else {
+            let rollout_score = if !last_score.is_terminal() {
                 self.rollout(&mut game)
+            } else {
+                0f32
             };
             // backprop
             self.backpropagate(&selected, rollout_score);
