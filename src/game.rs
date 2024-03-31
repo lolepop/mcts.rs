@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::{collections::VecDeque, fmt::Debug, fs::File, io::Write};
+use std::{collections::VecDeque, fmt::Debug, fs::File, io::Write, ops::Deref};
 use rand::seq::{IteratorRandom, SliceRandom};
 
 fn uct(score: f32, visits: u32, total_visits: u32, c: f32) -> f32 {
@@ -27,6 +27,13 @@ pub trait Game: Clone + Debug {
 
 #[derive(Debug, Clone, Copy)]
 struct NodeId(usize);
+impl Deref for NodeId {
+    type Target = usize;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+    
+}
 
 #[derive(Clone, Debug)]
 struct MctsNode<Move: Default + Debug> {
@@ -37,7 +44,7 @@ struct MctsNode<Move: Default + Debug> {
 
 struct MctsTree<Move: Default + Debug> {
     nodes: Vec<MctsNode<Move>>,
-    children: Vec<Vec<usize>>,
+    children: Vec<Vec<NodeId>>,
 }
 
 impl<Move: Default + Debug> MctsTree<Move> {
@@ -48,10 +55,10 @@ impl<Move: Default + Debug> MctsTree<Move> {
         }
     }
 
-    fn add_child(&mut self, node: usize, placement_move: Move) -> Option<usize> {
-        if node < self.nodes.len() {
-            let id = self.nodes.len();
-            self.children[node].push(id);
+    fn add_child(&mut self, node: NodeId, placement_move: Move) -> Option<NodeId> {
+        if *node < self.nodes.len() {
+            let id = NodeId(self.nodes.len());
+            self.children[*node].push(id);
             self.nodes.push(MctsNode { placement_move, score: 0f32, visits: 0 });
             self.children.push(Vec::new());
             Some(id)
@@ -60,12 +67,12 @@ impl<Move: Default + Debug> MctsTree<Move> {
         }
     }
 
-    fn children(&self, node: usize) -> Option<Vec<usize>> {
-        self.children.get(node).cloned()
+    fn children(&self, node: NodeId) -> Option<Vec<NodeId>> {
+        self.children.get(*node).cloned()
     }
 
-    fn node(&self, node: usize) -> Option<&MctsNode<Move>> {
-        self.nodes.get(node)
+    fn node(&self, node: NodeId) -> Option<&MctsNode<Move>> {
+        self.nodes.get(*node)
     }
 
     fn dump(&self) {
@@ -75,12 +82,13 @@ impl<Move: Default + Debug> MctsTree<Move> {
         while let Some(parent) = queue.pop_front() {
             if let Some(children) = self.children.get(parent) {
                 for child in children {
-                    let child_stats = &self.nodes[*child];
+                    let child = **child;
+                    let child_stats = &self.nodes[child];
                     if child_stats.visits > 0 {
                         f.write(format!("{parent}->{child};").as_bytes()).unwrap();
                         f.write(format!("{child} [label=<{child}<br/>move={:?}<br/>score={}<br/>visits={}>];", child_stats.placement_move, child_stats.score, child_stats.visits).as_bytes()).unwrap();
                     }
-                    queue.push_back(*child);
+                    queue.push_back(child);
                 }
             }
         }
@@ -93,15 +101,15 @@ impl<Move: Default + Debug> MctsTree<Move> {
 pub struct Mcts<G: Game> {
     tree: MctsTree<G::Move>,
     player_id: G::Player,
-    root: usize,
+    root: NodeId,
 }
 
 impl<G: Game> Mcts<G> {
     pub fn new(player_id: G::Player) -> Self {
-        Self { tree: MctsTree::new(), root: 0, player_id }
+        Self { tree: MctsTree::new(), root: NodeId(0), player_id }
     }
 
-    fn diff_existing_children(&self, existing: &Vec<usize>, truth: &Vec<G::Move>) -> Option<Vec<G::Move>> {
+    fn diff_existing_children(&self, existing: &Vec<NodeId>, truth: &Vec<G::Move>) -> Option<Vec<G::Move>> {
         let diff = existing.iter()
             .filter_map(|n| self.tree.node(*n))
             .filter_map(|n| truth.contains(&n.placement_move)
@@ -111,11 +119,7 @@ impl<G: Game> Mcts<G> {
         (diff.len() > 0).then(|| diff)
     }
 
-    // add option for games without perfect information
-    // place game move in here and check if possible moves at current play includes any new positions
-    // if there are, add unexplored nodes and select those
-    // maybe expand should be part of this function
-    fn select(&mut self, game: &mut G) -> (Vec<usize>, Option<f32>) {
+    fn select(&mut self, game: &mut G) -> (Vec<NodeId>, Option<f32>) {
         let mut traversal = vec![self.root];
         let mut last_score: Option<f32> = None;
         let mut pending_move_diff: Option<Vec<G::Move>> = None;
@@ -177,10 +181,6 @@ impl<G: Game> Mcts<G> {
         (traversal, last_score)
     }
 
-    // fn expand(&mut self, game: &G, mut traversal: Vec<usize>) -> Vec<usize> {
-        
-    // }
-
     fn rollout(&mut self, game: &mut G) -> f32 {
         loop {
             let random_move = game.possible_moves().choose(&mut rand::thread_rng()).unwrap().clone();
@@ -191,9 +191,9 @@ impl<G: Game> Mcts<G> {
         }
     }
 
-    fn backpropagate(&mut self, traversal: &Vec<usize>, score: f32) {
+    fn backpropagate(&mut self, traversal: &Vec<NodeId>, score: f32) {
         for id in traversal {
-            let n = &mut self.tree.nodes[*id];
+            let n = &mut self.tree.nodes[**id];
             n.visits += 1;
             n.score += score;
         }
@@ -201,7 +201,7 @@ impl<G: Game> Mcts<G> {
 
     // calculate best average score
     fn best_descendant(&self) -> (&MctsNode<<G as Game>::Move>, f32) {
-        self.tree.children[self.root].iter()
+        self.tree.children[*self.root].iter()
             .filter_map(|n| self.tree.node(*n))
             // .map(|n| (n, n.score / (n.visits as f32)))
             .map(|n| (n, n.visits as f32))
@@ -215,19 +215,7 @@ impl<G: Game> Mcts<G> {
             // let mut last_score: Option<f32> = None;
             // select and expand
             let (selected, last_score) = self.select(&mut game);
-            // for m in selected.iter().skip(1) {
-            //     let m = self.tree.node(*m).unwrap().placement_move.clone();
-            //     let s = game.place_move(m).unwrap();
-            //     last_score = game.score_state(s, self.player_id.clone());
-            // }
 
-            // // expand
-            // if last_score.is_none() {
-            //     selected = self.expand(&game, selected);
-            //     let expanded_placement = self.tree.node(*selected.last().unwrap()).unwrap().placement_move.clone();
-            //     let s = game.place_move(expanded_placement).unwrap();
-            //     last_score = game.score_state(s, self.player_id.clone());
-            // }
             // rollout
             let rollout_score = if let Some(premature_end_score) = last_score {
                 premature_end_score
