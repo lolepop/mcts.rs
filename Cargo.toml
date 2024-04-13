@@ -5,4 +5,12 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.81"
+either = "1.10.0"
+hashbrown = "0.14.3"
 rand = "0.8.5"
+
+[dev-dependencies]
+rayon = "1.10.0"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.5"

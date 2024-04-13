@@ -1,6 +1,8 @@
 use anyhow::Result;
-use std::{collections::VecDeque, fmt::Debug, fs::File, io::Write, ops::Deref};
-use rand::seq::{IteratorRandom, SliceRandom};
+use either::Either::{self, Left, Right};
+use hashbrown::HashMap;
+use std::{collections::VecDeque, fmt::Debug, fs::File, hash::Hash, io::Write, ops::Deref};
+use rand::seq::SliceRandom;
 
 fn uct(score: f32, visits: u32, total_visits: u32, c: f32) -> f32 {
     if visits == 0 {
@@ -36,7 +38,7 @@ impl MoveScore {
 pub trait Game: Clone + Debug {
     const IS_PERFECT_INFORMATION: bool;
 
-    type Move: Default + Debug + Clone + PartialEq;
+    type Move: Default + Debug + Clone + PartialEq + Hash + Eq;
     type GameState;
     type Player: Clone + Debug;
 
@@ -97,6 +99,10 @@ impl<Move: Default + Debug> MctsTree<Move> {
         self.nodes.get(*node)
     }
 
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
     fn dump(&self) {
         let mut f = File::create("./out.dot").unwrap();
         f.write("digraph G {overlap=\"scalexy;\"".as_bytes()).unwrap();
@@ -131,22 +137,34 @@ impl<G: Game> Mcts<G> {
         Self { tree: MctsTree::new(), root: NodeId(0), player_id }
     }
 
-    fn diff_existing_children(&self, existing: &Vec<NodeId>, truth: &Vec<G::Move>) -> Option<Vec<G::Move>> {
-        let diff = existing.iter()
-            .filter_map(|n| self.tree.node(*n))
-            .filter_map(|n| truth.contains(&n.placement_move)
-                .then(|| n.placement_move.clone())
+    fn diff_existing_children(&self, existing: &Vec<NodeId>, truth: &Vec<G::Move>) -> Either<Vec<G::Move>, Vec<NodeId>> {
+        let existing = existing.iter()
+            .filter_map(|id|
+                self.tree.node(*id)
+                    .map(|n| (n.placement_move.clone(), *id))
             )
+            .collect::<HashMap<_, _>>();
+        let diff = truth.iter()
+            .filter(|m| !existing.contains_key(*m))
+            .cloned()
             .collect::<Vec<_>>();
-        (diff.len() > 0).then(|| diff)
+        if diff.len() > 0 {
+            Left(diff)
+        } else {
+            // if no difference, no new nodes should exist
+            let nodes = truth.iter()
+                .map(|m| *existing.get(m).unwrap())
+                .collect();
+            Right(nodes)
+        }
     }
 
-    fn select(&mut self, game: &mut G) -> Vec<(NodeId, MoveScore)> {
+    fn select(&mut self, game: &mut G) -> Result<Vec<(NodeId, MoveScore)>> {
         let mut traversal = vec![(self.root, MoveScore::None)];
         let mut pending_move_diff: Option<Vec<G::Move>> = None;
         loop {
             let (last_id, _) = *traversal.last().unwrap();
-            let node_children = self.tree.children(last_id).unwrap();
+            let mut node_children = self.tree.children(last_id).unwrap();
             if node_children.len() == 0 {
                 // println!("selection: {traversal:?}");
                 break;
@@ -154,9 +172,15 @@ impl<G: Game> Mcts<G> {
 
             // scan current moves, checking if does not match all moves in existing children nodes
             if !G::IS_PERFECT_INFORMATION {
-                if let Some(diff) = self.diff_existing_children(&node_children, &game.possible_moves()) {
-                    pending_move_diff.replace(diff);
-                    break;
+                match self.diff_existing_children(&node_children, &game.possible_moves()) {
+                    Left(diff) => {
+                        pending_move_diff.replace(diff);
+                        break;
+                    },
+                    Right(valid_nodes) => {
+                        // filter node_children, limit to possible moves only
+                        node_children = valid_nodes;
+                    }
                 }
             }
 
@@ -168,7 +192,7 @@ impl<G: Game> Mcts<G> {
                     .max_by(|(_, a, _), (_, b, _)| a.total_cmp(b))
                     .unwrap();
             
-            let s = game.place_move(placement_move).unwrap();
+            let s = game.place_move(placement_move)?;
             let last_score = game.score_state(s, self.player_id.clone());
             traversal.push((node_children[selected_node], last_score));
 
@@ -180,7 +204,7 @@ impl<G: Game> Mcts<G> {
 
         // exit early if terminal node was selected
         if last_score.is_terminal() {
-            return traversal;
+            return Ok(traversal);
         }
 
         let next_selection = if let Some(mut pending_move_diff) = pending_move_diff {
@@ -202,19 +226,19 @@ impl<G: Game> Mcts<G> {
         let last_score = game.score_state(s, self.player_id.clone());
 
         traversal.push((next_selection, last_score));
-        traversal
+        Ok(traversal)
     }
 
     // only returns scoring of terminal state
-    fn rollout(&mut self, game: &mut G) -> f32 {
+    fn rollout(&mut self, game: &mut G) -> Result<f32> {
         let mut acc_score = 0f32;
         loop {
             let random_move = game.possible_moves().choose(&mut rand::thread_rng()).unwrap().clone();
-            let s = game.place_move(random_move).unwrap();
+            let s = game.place_move(random_move)?;
             let score = game.score_state(s, self.player_id.clone());
             acc_score += score.score();
             if score.is_terminal() {
-                return acc_score;
+                return Ok(acc_score);
             }
         }
     }
@@ -239,30 +263,41 @@ impl<G: Game> Mcts<G> {
             .unwrap()
     }
 
-    pub fn best_move(&mut self, base_game: &G, iterations: usize) -> G::Move {
-        for _ in 0..iterations {
+    pub fn best_move(&mut self, base_game: &G, iterations: usize, retry_failed: bool) -> G::Move {
+        let mut simulate = || -> Result<()> {
             let mut game = base_game.clone();
             // let mut last_score: Option<f32> = None;
             // select and expand
-            let selected = self.select(&mut game);
+            let selected = self.select(&mut game)?;
 
             let (_, last_score) = selected.last().unwrap();
 
             // rollout
             let rollout_score = if !last_score.is_terminal() {
-                self.rollout(&mut game)
+                self.rollout(&mut game)?
             } else {
                 0f32
             };
             // backprop
             self.backpropagate(&selected, rollout_score);
+            // println!("iter {i}: {} nodes", self.tree.len());
+            Ok(())
+        };
+
+        let mut i = 0usize;
+        while i < iterations {
+            if let Err(e) = simulate() {
+                if retry_failed {
+                    eprintln!("encountered error during simulation {e}");
+                    continue;
+                }
+                panic!("{e}");
+            }
+            i += 1;
         }
 
-        // self.tree.dump();
-        // todo!()
-
         let (best_move, best_score) = self.best_descendant();
-        println!("player {:?}: move {:?} ({best_score})", self.player_id, best_move.placement_move);
+        // println!("player {:?}: move {:?} ({best_score})", self.player_id, best_move.placement_move);
         best_move.placement_move.clone()
     }
 

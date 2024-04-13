@@ -1,0 +1,11 @@
+name: run tests
+on: workflow_dispatch
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo test -r -- --include-ignored --nocapture --test-threads=1
+
